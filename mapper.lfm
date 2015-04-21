@@ -1,0 +1,19 @@
+object NetMonitorMapper: TNetMonitorMapper
+  DaemonDefs = <  
+    item
+      DaemonClassName = 'TNetMonitorDaemon'
+      Name = 'Net Monitor'
+      Description = 'Net Monitor'
+      DisplayName = 'Net Monitor'
+      Options = [doAllowStop, doAllowPause]
+      WinBindings.Dependencies = <>
+      WinBindings.StartType = stAuto
+      WinBindings.WaitHint = 0
+      WinBindings.IDTag = 0
+      WinBindings.ServiceType = stWin32
+      WinBindings.ErrorSeverity = esIgnore
+      LogStatusReport = False
+    end>
+  left = 808
+  top = 154
+end

@@ -1,0 +1,11 @@
+object NetMonitorDaemon: TNetMonitorDaemon
+  OnCreate = DataModuleCreate
+  OldCreateOrder = False
+  OnStart = DataModuleStart
+  OnStop = DataModuleStop
+  OnExecute = DataModuleExecute
+  Height = 150
+  HorizontalOffset = 808
+  VerticalOffset = 154
+  Width = 150
+end
