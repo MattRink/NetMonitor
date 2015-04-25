@@ -22,6 +22,14 @@ const
   ETHERTYPE_SNMP      = $814C;
   ETHERTYPE_LLDP      = $88CC;
 
+  TCP_PROTOCOL_ICMP   = 1;
+  TCP_PROTOCOL_IGMP   = 2;
+  TCP_PROTOCOL_TCP    = 6;
+  TCP_PROTOCOL_UDP    = 17;
+  TCP_PROTOCOL_ENCAP  = 41;
+  TCP_PROTOCOL_OSPF   = 89;
+  TCP_PROTOCOL_SCTP   = 132;
+
 type
   TErrBuff = array[0..PCAP_ERRBUF_SIZE] of Char;
 
@@ -59,6 +67,27 @@ type
     OptionPadding : Cardinal;
   end;
 
+  PTCPHeader = ^TTCPHeader;
+  TTCPHeader = packed record
+    SourcePort : Word;
+    DestinationPort : Word;
+    SequenceNumber : LongInt;
+    AcknowledgementNumber : LongInt;
+    DataOffsetFlages : SmallInt;
+    WindowSize : SmallInt;
+    Checksum : SmallInt;
+    Urgent : SmallInt;
+    OptionPadding : Cardinal;
+  end;
+
+  PUDPHeader = ^TUDPHeader;
+  TUDPHeader = packed record
+    SourcePort : Word;
+    DestinationPort : Word;
+    Length : Word;
+    Checksum : Word;
+  end;
+
   PARPHeader = ^TARPHeader;
   TARPHeader = packed record
     HardwareType : Word;
@@ -77,7 +106,11 @@ type
     FLogger : TSnifferThreadLogger;
   public
     constructor Create(ALogger : TSnifferThreadLogger);
-    procedure HandleARP(APkt : PPChar);
+    procedure DoLog(AMessage : String);
+    procedure HandleARP(APkt : LongWord; ALength : Cardinal);
+    procedure HandleIPv4(APkt : LongWord; ALength : Cardinal);
+    procedure HandleTCP(APkt : LongWord; ALength : Cardinal);
+    procedure HandleUDP(APkt : LongWord; ALength : Cardinal);
   end;
 
   TSnifferThread = class(TThread)
@@ -108,7 +141,7 @@ type
     FTimeStarted : TDateTime;
 
     procedure DoLog(AMessage : String);
-    procedure CheckForError(AMethod : String);
+    procedure CheckForPcapError(AMethod : String);
     function CharArrayToString(ACharArray : array of Char) : String;
     function IntegerToDottedDecimal(AWord : DWord) : String;
     function GetInterfaceNet : string;
@@ -148,20 +181,108 @@ begin
   HardwareAddressToStr := LeftStr(S, 17);
 end;
 
+function ToHostOrder(AWord : Word) : Word;
+begin
+  {$IFDEF ENDIAN_LITTLE}
+  ToHostOrder := SwapEndian(AWord);
+  {$ELSE}
+  ToHostOrder := AWord;
+  {$ENDIF}
+end;
+
+function ToHostOrder(ASmallInt : SmallInt) : SmallInt;
+begin
+  {$IFDEF ENDIAN_LITTLE}
+  ToHostOrder := SwapEndian(ASmallInt);
+  {$ELSE}
+  ToHostOrder := ASmallInt;
+  {$ENDIF}
+end;
+
+function ToHostOrder(ACardinal : Cardinal) : Cardinal;
+begin
+  {$IFDEF ENDIAN_LITTLE}
+  ToHostOrder := SwapEndian(ACardinal);
+  {$ELSE}
+  ToHostOrder := ACardinal;
+  {$ENDIF}
+end;
+
 constructor TPacketHandler.Create(ALogger : TSnifferThreadLogger);
 begin
   FLogger := ALogger;
 end;
 
-procedure TPacketHandler.HandleARP(APkt : PPChar);
+procedure TPacketHandler.DoLog(AMessage : String);
+begin
+  FLogger(AMessage);
+end;
+
+procedure TPacketHandler.HandleARP(APkt : LongWord; ALength : Cardinal);
 var
   ARPHeader : PARPHeader;
+  Op : String;
 begin
-  ARPHeader := @PChar(APkt + SizeOf(TEthernetHeader))^;
+  ARPHeader := PARPHeader(APkt);
 
-  FLogger(Format('ARP - Sender: %s (%s), Target: %s (%s)',
-    [NetAddrToStr(ARPHeader^.SenderIPAddress), HardwareAddressToStr(ARPHeader^.SenderHardwareAddress.Bytes),
+  ARPHeader^.HardwareType := ToHostOrder(ARPHeader^.HardwareType);
+  ARPHeader^.ProtocolType := ToHostOrder(ARPHeader^.ProtocolType);
+  ARPHeader^.OperationCode := ToHostOrder(ARPHeader^.OperationCode);
+
+  if ARPHeader^.OperationCode = 1 then
+    Op := 'Request'
+  else if ARPHeader^.OperationCode = 2 then
+    Op := 'Reply'
+  else
+    Op := 'Unknown';
+
+  DoLog(Format('ARP %s - Sender: %s (%s), Target: %s (%s)',
+    [Op,
+     NetAddrToStr(ARPHeader^.SenderIPAddress), HardwareAddressToStr(ARPHeader^.SenderHardwareAddress.Bytes),
      NetAddrToStr(ARPHeader^.TargetIPAddress), HardwareAddressToStr(ARPHeader^.TargetHardwareAddress.Bytes)]));
+end;
+
+procedure TPacketHandler.HandleIPv4(APkt : LongWord; ALength: Cardinal);
+var
+  IPv4Header : PIPv4Header;
+  HeaderLength : DWord;
+begin
+  IPv4Header := PIPv4Header(APkt);
+
+  IPv4Header^.TotalLength := ToHostOrder(IPv4Header^.TotalLength);
+  IPv4Header^.Identification := ToHostOrder(IPv4Header^.Identification);
+  IPv4Header^.FlagsFO := ToHostOrder(IPv4Header^.FlagsFO);
+  IPv4Header^.CRC := ToHostOrder(IPv4Header^.CRC);
+  IPv4Header^.OptionPadding := ToHostOrder(IPv4Header^.OptionPadding);
+
+  HeaderLength := Round(((IPv4Header^.VersionIHL and $F) * 32) / 8);
+
+  DoLog(Format('IPv4 - Source: %s, Destination: %s', [NetAddrToStr(IPv4Header^.SourceIP), NetAddrToStr(IPv4Header^.DestinationIP)]));
+
+  case IPv4Header^.Protocol of
+    TCP_PROTOCOL_TCP : HandleTCP(PtrUInt(APkt) + HeaderLength, ALength);
+    TCP_PROTOCOL_UDP : HandleUDP(PtrUInt(APkt) + HeaderLength, ALength);
+  else
+    DoLog(Format('Unknown IPv4 protocol %d', [IPv4Header^.Protocol]));
+  end;
+end;
+
+procedure TPacketHandler.HandleTCP(APkt : LongWord; ALength : Cardinal);
+var
+  TCPHeader : PTCPHeader;
+begin
+  TCPHeader := PTCPHeader(APkt);
+
+  DoLog(Format('TCP - Source Port: %d, Destination Port: %d', [TCPHeader^.SourcePort, TCPHeader^.DestinationPort]));
+end;
+
+procedure TPacketHandler.HandleUDP(APkt : LongWord; ALength : Cardinal);
+var
+  UDPHeader : PUDPHeader;
+begin
+  UDPHeader := PUDPHeader(APkt);
+
+  DoLog(Format('UDP - Source Port: %d, Destination Port: %d', [UDPHeader^.SourcePort, UDPHeader^.DestinationPort]));
 end;
 
 constructor TSnifferThread.Create(APcapHandle : PPcap; ASnifferHandler : TSnifferHandler; ASnifferThreadLogger : TSnifferThreadLogger);
@@ -178,15 +299,15 @@ end;
 
 procedure TSnifferThread.Execute;
 var
-  Res : integer;
+  Res : Integer;
   PktHeader : PPcap_Pkthdr;
   Pkt : PPChar;
-  Len : Integer;
+  Len : Cardinal;
   EthernetHeader : PEthernetHeader;
 begin
   DoLog('Starting sniffer thread');
 
-  while true do
+  while not Terminated do
   begin
     Res := pcap_next_ex(FPcapHandle, @PktHeader, @Pkt);
     if Res = 0 then
@@ -195,7 +316,7 @@ begin
     end
     else if Res < 0 then
     begin
-      DoLog('Res < 0, breaking');
+      DoLog(Format('Res = %d, breaking', [Res]));
       break;
     end;
 
@@ -204,16 +325,15 @@ begin
 
     if TheSniffer.LinkType = DATALINK_ETHERNET then
     begin
-      EthernetHeader := @Pkt^;
-      DoLog('Ethernet: ' + HardwareAddressToStr(EthernetHeader^.SourceHost.Bytes) + ' -> ' + HardwareAddressToStr(EthernetHeader^.DestinationHost.Bytes));
+      EthernetHeader := PEthernetHeader(Pkt);
+      EthernetHeadeR^.EthernetType := ToHostOrder(EthernetHeader^.EthernetType);
 
-      case Swap(EthernetHeader^.EthernetType) of
-        ETHERTYPE_IPV4 : DoLog('IPv4');
+      DoLog(Format('Ethernet - %s -> %s', [HardwareAddressToStr(EthernetHeader^.SourceHost.Bytes), HardwareAddressToStr(EthernetHeader^.DestinationHost.Bytes)]));
+
+      case EthernetHeader^.EthernetType of
+        ETHERTYPE_IPV4 : FPacketHandler.HandleIPv4(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len);
         ETHERTYPE_IPV6 : DoLog('IPv6');
-        ETHERTYPE_ARP  :
-          begin
-            FPacketHandler.HandleARP(@Pkt);
-          end;
+        ETHERTYPE_ARP  : FPacketHandler.HandleARP(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len);
       else
         DoLog('Other: ' + Format('%.2x', [EthernetHeader^.EthernetType]));
       end;
@@ -269,22 +389,18 @@ begin
 
   DoLog(StrPas(TheSniffer.PcapLibVersion));
 
-  DoLog(Format('Ethernet header length is %d bytes', [SizeOf(TEthernetHeader)]));
-  DoLog(Format('IPv4 header length is %d bytes', [SizeOf(TIPv4Header)]));
-  DoLog(Format('ARP header length is %d bytes', [SizeOf(TARPHeader)]));
-
   if FDevice = '' then
   begin
     FDevice := pcap_lookupdev(FPcapErrBuff);
     if not Assigned(FDevice) then
-      CheckForError('pcap_lookupdev');
+      CheckForPcapError('pcap_lookupdev');
   end;
 
   if pcap_lookupnet(FDevice, @FNet, @FMask, FPcapErrBuff) = -1 then
-    CheckForError('pcap_lookupnet');
+    CheckForPcapError('pcap_lookupnet');
 
   if pcap_findalldevs(@AllDevs, FPcapErrBuff) = -1 then
-    CheckForError('pcap_findalldevs');
+    CheckForPcapError('pcap_findalldevs');
 
   Dev := AllDevs^;
   while Dev <> nil do
@@ -297,7 +413,7 @@ begin
       begin
         DoLog('IP address: ' + NetAddrToStr(DevAddr^.addr^.sin_addr));
         DoLog('Netmask: ' + NetAddrToStr(DevAddr^.netmask^.sin_addr));
-        // DoLog('  Broadcast address: ' + NetAddrToStr(DevAddr^.broadaddr^.sin_addr));
+        DoLog('Broadcast address: ' + NetAddrToStr(DevAddr^.broadaddr^.sin_addr));
       end;
       DevAddr := DevAddr^.next;
     end;
@@ -315,7 +431,7 @@ begin
   FPcapHandle := pcap_open_live(FDevice, BUFLEN, 1, 1000, FPcapErrBuff);
   if not Assigned(FPcapHandle) then
   begin
-    CheckForError('pcap_open_live');
+    CheckForPcapError('pcap_open_live');
   end;
 
   FLinkType := pcap_datalink(FPcapHandle);
@@ -333,13 +449,14 @@ procedure TSniffer.Stop;
 begin
   if FStarted then
   begin
+    FSnifferThread.Terminate;
+    FSnifferThread := nil;
     pcap_close(FPcapHandle);
     FStarted := false;
-    FSnifferThread := nil;
   end;
 end;
 
-procedure TSniffer.CheckForError(AMethod : String);
+procedure TSniffer.CheckForPcapError(AMethod : String);
 var
   I : integer;
 begin
