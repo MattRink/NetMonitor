@@ -7,7 +7,8 @@ interface
 uses
   Classes, SysUtils,
   INIFiles, Sockets, DateUtils,
-  Pcap;
+  Pcap,
+  Logger, Services;
 
 const
   BUFLEN = 65535;
@@ -38,8 +39,6 @@ type
   TSnifferHandler = procedure(ASecondsSinceStart : double; ALength : integer) of object;
 
   TSnifferLogger = procedure(AMessage : String; ASecondsSinceStart : double) of object;
-
-  TSnifferThreadLogger = procedure(AMessage : String) of object;
 
   THardwareAddress = packed record
     Bytes : array[1..6] of byte;
@@ -73,7 +72,7 @@ type
     DestinationPort : Word;
     SequenceNumber : LongInt;
     AcknowledgementNumber : LongInt;
-    DataOffsetFlages : SmallInt;
+    DataOffsetFlags : SmallInt;
     WindowSize : SmallInt;
     Checksum : SmallInt;
     Urgent : SmallInt;
@@ -103,26 +102,40 @@ type
 
   TPacketHandler = class(TObject)
   private
-    FLogger : TSnifferThreadLogger;
+    FLogger : TLogger;
+    FServiceHandler : TServiceHandler;
   public
-    constructor Create(ALogger : TSnifferThreadLogger);
+    constructor Create;
     procedure DoLog(AMessage : String);
     procedure HandleARP(APkt : LongWord; ALength : Cardinal);
     procedure HandleIPv4(APkt : LongWord; ALength : Cardinal);
     procedure HandleTCP(APkt : LongWord; ALength : Cardinal);
     procedure HandleUDP(APkt : LongWord; ALength : Cardinal);
+
+    property Logger : TLogger read FLogger write FLogger;
+    property ServiceHandler : TServiceHandler read FServiceHandler write FServiceHandler;
   end;
+
+  TSniffer = class;
 
   TSnifferThread = class(TThread)
   private
     FPcapHandle : PPcap;
+    FSniffer : TSniffer;
     FSnifferHandler : TSnifferHandler;
-    FSnifferThreadLogger : TSnifferThreadLogger;
+    FLogger : TLogger;
     FPacketHandler : TPacketHandler;
+    FServiceHandler : TServiceHandler;
+
+    procedure SetLogger(ALogger : TLogger);
   public
-    constructor Create(APcapHandle : PPcap; ASnifferHandler : TSnifferHandler; ASnifferThreadLogger : TSnifferThreadLogger);
+    constructor Create(ASniffer : TSniffer; APcapHandle : PPcap; ASnifferHandler : TSnifferHandler);
     procedure Execute; override;
     procedure DoLog(AMessage : String);
+
+    property Logger : TLogger read FLogger write SetLogger;
+    property PacketHandler : TPacketHandler read FPacketHandler write FPacketHandler;
+    property ServiceHandler : TServiceHandler read FServiceHandler write FServiceHandler;
   end;
 
   TSniffer = class(TComponent)
@@ -135,6 +148,8 @@ type
     FMask : PDword;
     FPcapHandle : PPcap;
     FSnifferHandler : TSnifferHandler;
+    FPacketHandler : TPacketHandler;
+    FServiceHandler : TServiceHandler;
     FSnifferLogger : TSnifferLogger;
     FSnifferThread : TSnifferThread;
     FStarted : boolean;
@@ -158,14 +173,13 @@ type
     property PcapDevice : PChar read FDevice;
     property LinkType : integer read FLinkType;
     property Handler : TSnifferHandler read FSnifferHandler write FSnifferHandler;
+    property PacketHandler : TPacketHandler read FPacketHandler;
+    property ServiceHandler : TServiceHandler read FServiceHandler;
     property Logger : TSnifferLogger read FSnifferLogger write FSnifferLogger;
     property InterfaceNet : String read GetInterfaceNet;
     property InterfaceMask : String read GetInterfaceNet;
     property SecondsSinceStart : double read GetSecondsSinceStart;
   end;
-
-var
-  TheSniffer : TSniffer;
 
 implementation
 
@@ -208,14 +222,15 @@ begin
   {$ENDIF}
 end;
 
-constructor TPacketHandler.Create(ALogger : TSnifferThreadLogger);
+constructor TPacketHandler.Create();
 begin
-  FLogger := ALogger;
+
 end;
 
 procedure TPacketHandler.DoLog(AMessage : String);
 begin
-  FLogger(AMessage);
+  if Assigned(FLogger) then
+    FLogger(AMessage);
 end;
 
 procedure TPacketHandler.HandleARP(APkt : LongWord; ALength : Cardinal);
@@ -270,10 +285,16 @@ end;
 procedure TPacketHandler.HandleTCP(APkt : LongWord; ALength : Cardinal);
 var
   TCPHeader : PTCPHeader;
+  HeaderLength : DWord;
 begin
   TCPHeader := PTCPHeader(APkt);
 
   DoLog(Format('TCP - Source Port: %d, Destination Port: %d', [TCPHeader^.SourcePort, TCPHeader^.DestinationPort]));
+
+  HeaderLength := Round(((TCPHeader^.DataOffsetFlags and $F) * 32) / 8);
+
+  if Assigned(FServiceHandler) then
+    FServiceHandler.HandleService(PtrUInt(APkt) + HeaderLength, ALength, TCPHeader^.DestinationPort);
 end;
 
 procedure TPacketHandler.HandleUDP(APkt : LongWord; ALength : Cardinal);
@@ -285,14 +306,12 @@ begin
   DoLog(Format('UDP - Source Port: %d, Destination Port: %d', [UDPHeader^.SourcePort, UDPHeader^.DestinationPort]));
 end;
 
-constructor TSnifferThread.Create(APcapHandle : PPcap; ASnifferHandler : TSnifferHandler; ASnifferThreadLogger : TSnifferThreadLogger);
+constructor TSnifferThread.Create(ASniffer : TSniffer; APcapHandle : PPcap; ASnifferHandler : TSnifferHandler);
 begin
+  FSniffer := ASniffer;
   FPcapHandle := APcapHandle;
   FSnifferHandler := ASnifferHandler;
-  FSnifferThreadLogger := ASnifferThreadLogger;
   FreeOnTerminate := true;
-
-  FPacketHandler := TPacketHandler.Create(FSnifferThreadLogger);
 
   inherited Create(true);
 end;
@@ -321,9 +340,9 @@ begin
     end;
 
     Len := PktHeader^.caplen;
-    TheSniffer.Handler(TheSniffer.SecondsSinceStart, Len);
+    FSniffer.Handler(FSniffer.SecondsSinceStart, Len);
 
-    if TheSniffer.LinkType = DATALINK_ETHERNET then
+    if FSniffer.LinkType = DATALINK_ETHERNET then
     begin
       EthernetHeader := PEthernetHeader(Pkt);
       EthernetHeadeR^.EthernetType := ToHostOrder(EthernetHeader^.EthernetType);
@@ -331,9 +350,21 @@ begin
       DoLog(Format('Ethernet - %s -> %s', [HardwareAddressToStr(EthernetHeader^.SourceHost.Bytes), HardwareAddressToStr(EthernetHeader^.DestinationHost.Bytes)]));
 
       case EthernetHeader^.EthernetType of
-        ETHERTYPE_IPV4 : FPacketHandler.HandleIPv4(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len);
+        ETHERTYPE_IPV4 :
+          begin
+            if Assigned(FPacketHandler) then
+              FPacketHandler.HandleIPv4(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len)
+            else
+              DoLog('No packet handler assigned');
+          end;
         ETHERTYPE_IPV6 : DoLog('IPv6');
-        ETHERTYPE_ARP  : FPacketHandler.HandleARP(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len);
+        ETHERTYPE_ARP  :
+          begin
+            if Assigned(FPacketHandler) then
+              FPacketHandler.HandleARP(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len)
+            else
+              DoLog('No packet handler assigned');
+          end;
       else
         DoLog('Other: ' + Format('%.2x', [EthernetHeader^.EthernetType]));
       end;
@@ -344,10 +375,15 @@ begin
   DoLog('Finished sniffing');
 end;
 
+procedure TSnifferThread.SetLogger(ALogger : TLogger);
+begin
+  FLogger := ALogger;
+end;
+
 procedure TSnifferThread.DoLog(AMessage : String);
 begin
-  if Assigned(FSnifferThreadLogger) then
-    FSnifferThreadLogger(Format('%s', [AMessage]));
+  if Assigned(FLogger) then
+    FLogger(Format('%s', [AMessage]));
 end;
 
 constructor TSniffer.Create(AOwner : TComponent);
@@ -387,7 +423,7 @@ var
 begin
   FPcapLibVersion := pcap_lib_version();
 
-  DoLog(StrPas(TheSniffer.PcapLibVersion));
+  DoLog(StrPas(PcapLibVersion));
 
   if FDevice = '' then
   begin
@@ -439,7 +475,17 @@ begin
 
   FTimeStarted := Now();
 
-  FSnifferThread := TSnifferThread.Create(FPcapHandle, FSnifferHandler, @DoLog);
+  FPacketHandler := TPacketHandler.Create;
+  FPacketHandler.Logger := @DoLog;
+  FServiceHandler := TServiceHandler.Create;
+  FServiceHandler.Logger := @DoLog;
+
+  FPacketHandler.ServiceHandler := FServiceHandler;
+
+  FSnifferThread := TSnifferThread.Create(self, FPcapHandle, FSnifferHandler);
+  FSnifferThread.Logger := @DoLog;
+  FSnifferThread.PacketHandler := FPacketHandler;
+  FSnifferThread.ServiceHandler := FServiceHandler;
   FSnifferThread.Start;
 
   FStarted := true;
@@ -450,7 +496,12 @@ begin
   if FStarted then
   begin
     FSnifferThread.Terminate;
-    FSnifferThread := nil;
+
+    FServiceHandler.Free;
+    FPacketHandler.Free;
+
+    FSnifferThread.Free;
+
     pcap_close(FPcapHandle);
     FStarted := false;
   end;
@@ -510,7 +561,6 @@ begin
 end;
 
 initialization
-  TheSniffer := TSniffer.Create(nil);
 
 end.
 
