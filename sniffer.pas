@@ -8,7 +8,7 @@ uses
   Classes, SysUtils,
   INIFiles, Sockets, DateUtils,
   Pcap,
-  Logger, Services;
+  Logger, Services, NetworkUtils;
 
 const
   BUFLEN = 65535;
@@ -30,6 +30,9 @@ const
   TCP_PROTOCOL_ENCAP  = 41;
   TCP_PROTOCOL_OSPF   = 89;
   TCP_PROTOCOL_SCTP   = 132;
+
+  ARP_REQUEST = 1;
+  ARP_REPLY   = 2;
 
 type
   TErrBuff = array[0..PCAP_ERRBUF_SIZE] of Char;
@@ -68,8 +71,8 @@ type
 
   PTCPHeader = ^TTCPHeader;
   TTCPHeader = packed record
-    SourcePort : Word;
     DestinationPort : Word;
+    SourcePort : Word;
     SequenceNumber : LongInt;
     AcknowledgementNumber : LongInt;
     DataOffsetFlags : SmallInt;
@@ -81,8 +84,8 @@ type
 
   PUDPHeader = ^TUDPHeader;
   TUDPHeader = packed record
-    SourcePort : Word;
     DestinationPort : Word;
+    SourcePort : Word;
     Length : Word;
     Checksum : Word;
   end;
@@ -183,45 +186,6 @@ type
 
 implementation
 
-function HardwareAddressToStr(Bytes : array of byte) : string;
-var
-  I : integer;
-  S : String;
-begin
-  S := '';
-  for I := Low(Bytes) to High(Bytes) do
-    S := S + Format('%.2x:', [Bytes[I]]);
-
-  HardwareAddressToStr := LeftStr(S, 17);
-end;
-
-function ToHostOrder(AWord : Word) : Word;
-begin
-  {$IFDEF ENDIAN_LITTLE}
-  ToHostOrder := SwapEndian(AWord);
-  {$ELSE}
-  ToHostOrder := AWord;
-  {$ENDIF}
-end;
-
-function ToHostOrder(ASmallInt : SmallInt) : SmallInt;
-begin
-  {$IFDEF ENDIAN_LITTLE}
-  ToHostOrder := SwapEndian(ASmallInt);
-  {$ELSE}
-  ToHostOrder := ASmallInt;
-  {$ENDIF}
-end;
-
-function ToHostOrder(ACardinal : Cardinal) : Cardinal;
-begin
-  {$IFDEF ENDIAN_LITTLE}
-  ToHostOrder := SwapEndian(ACardinal);
-  {$ELSE}
-  ToHostOrder := ACardinal;
-  {$ENDIF}
-end;
-
 constructor TPacketHandler.Create();
 begin
 
@@ -244,12 +208,12 @@ begin
   ARPHeader^.ProtocolType := ToHostOrder(ARPHeader^.ProtocolType);
   ARPHeader^.OperationCode := ToHostOrder(ARPHeader^.OperationCode);
 
-  if ARPHeader^.OperationCode = 1 then
-    Op := 'Request'
-  else if ARPHeader^.OperationCode = 2 then
-    Op := 'Reply'
-  else
-    Op := 'Unknown';
+  case ARPHeader^.OperationCode of
+    ARP_REQUEST : Op := 'Request';
+    ARP_REPLY   : Op := 'Reply';
+    else
+      Op := 'Unknown';
+  end;
 
   DoLog(Format('ARP %s - Sender: %s (%s), Target: %s (%s)',
     [Op,
@@ -275,8 +239,9 @@ begin
   DoLog(Format('IPv4 - Source: %s, Destination: %s', [NetAddrToStr(IPv4Header^.SourceIP), NetAddrToStr(IPv4Header^.DestinationIP)]));
 
   case IPv4Header^.Protocol of
-    TCP_PROTOCOL_TCP : HandleTCP(PtrUInt(APkt) + HeaderLength, ALength);
-    TCP_PROTOCOL_UDP : HandleUDP(PtrUInt(APkt) + HeaderLength, ALength);
+    TCP_PROTOCOL_TCP  : HandleTCP(PtrUInt(APkt) + HeaderLength, ALength - HeaderLength);
+    TCP_PROTOCOL_UDP  : HandleUDP(PtrUInt(APkt) + HeaderLength, ALength - HeaderLength);
+    TCP_PROTOCOL_ICMP : DoLog('ICMP Recived');
   else
     DoLog(Format('Unknown IPv4 protocol %d', [IPv4Header^.Protocol]));
   end;
@@ -294,16 +259,22 @@ begin
   HeaderLength := Round(((TCPHeader^.DataOffsetFlags and $F) * 32) / 8);
 
   if Assigned(FServiceHandler) then
-    FServiceHandler.HandleService(PtrUInt(APkt) + HeaderLength, ALength, TCPHeader^.DestinationPort);
+    FServiceHandler.HandleService(PtrUInt(APkt) + HeaderLength, ALength - HeaderLength, TCPHeader^.SourcePort, TCPHeader^.DestinationPort);
 end;
 
 procedure TPacketHandler.HandleUDP(APkt : LongWord; ALength : Cardinal);
 var
   UDPHeader : PUDPHeader;
+  HeaderLength : DWord;
 begin
   UDPHeader := PUDPHeader(APkt);
 
   DoLog(Format('UDP - Source Port: %d, Destination Port: %d', [UDPHeader^.SourcePort, UDPHeader^.DestinationPort]));
+
+  HeaderLength := 8;
+
+  if Assigned(FServiceHandler) then
+    FServiceHandler.HandleService(PtrUInt(APkt) + HeaderLength, ALength - HeaderLength, UDPHeader^.SourcePort, UDPHeader^.DestinationPort);
 end;
 
 constructor TSnifferThread.Create(ASniffer : TSniffer; APcapHandle : PPcap; ASnifferHandler : TSnifferHandler);
@@ -311,7 +282,7 @@ begin
   FSniffer := ASniffer;
   FPcapHandle := APcapHandle;
   FSnifferHandler := ASnifferHandler;
-  FreeOnTerminate := true;
+  FreeOnTerminate := false;
 
   inherited Create(true);
 end;
@@ -353,7 +324,7 @@ begin
         ETHERTYPE_IPV4 :
           begin
             if Assigned(FPacketHandler) then
-              FPacketHandler.HandleIPv4(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len)
+              FPacketHandler.HandleIPv4(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len - SizeOf(TEthernetHeader))
             else
               DoLog('No packet handler assigned');
           end;
@@ -361,7 +332,7 @@ begin
         ETHERTYPE_ARP  :
           begin
             if Assigned(FPacketHandler) then
-              FPacketHandler.HandleARP(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len)
+              FPacketHandler.HandleARP(PtrUInt(Pkt) + SizeOf(TEthernetHeader), Len - SizeOf(TEthernetHeader))
             else
               DoLog('No packet handler assigned');
           end;
@@ -495,12 +466,18 @@ procedure TSniffer.Stop;
 begin
   if FStarted then
   begin
-    FSnifferThread.Terminate;
+    try
+      FSnifferThread.Terminate;
 
-    FServiceHandler.Free;
-    FPacketHandler.Free;
+      FSnifferThread.Free;
+      FSnifferThread := nil;
 
-    FSnifferThread.Free;
+      FServiceHandler.Free;
+      FPacketHandler.Free;
+    except
+      on E : Exception do
+        DoLog(E.Message);
+    end;
 
     pcap_close(FPcapHandle);
     FStarted := false;
