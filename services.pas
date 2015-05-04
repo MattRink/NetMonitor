@@ -5,7 +5,7 @@ unit Services;
 interface
 
 uses
-  Classes, SysUtils, Math,
+  Classes, SysUtils, Math, Sockets,
   Logger, NetworkUtils;
 
 const
@@ -66,6 +66,7 @@ type
   TCharArray = array of char;
   PByteArray = ^TByteArray;
   TByteArray = array of byte;
+  PByte = ^Byte;
   PWord = ^Word;
   PInteger = ^Integer;
 
@@ -133,30 +134,32 @@ var
   IsQuery : boolean;
   DNSQueryRecord : TDNSResourceRecord;
   DNSAnswerRecords : array of TDNSResourceRecord;
-  I, A : integer;
+  I, A, B : integer;
+  AInetAddr : in_addr;
 
   procedure GetResourceRecordName(var AResourceRecord : TDNSResourceRecord; APointer : LongWord);
   var
     Name : TCharArray;
     NameLabelLength : Byte;
-    N : integer;
+    L, N : integer;
   begin
     Name := TCharArray(PtrUInt(APointer));
-    I := 0;
+    L := 0;
     while true do
     begin
-      NameLabelLength := Byte(Name[I]);
+      NameLabelLength := Byte(Name[L]);
       for N := 1 to NameLabelLength do // Starting at 1 skips the length byte
-        AResourceRecord.Name := AResourceRecord.Name + Name[I + N];
+        AResourceRecord.Name := AResourceRecord.Name + Name[L + N];
 
-      I := I + N + 1;
+      L := L + N + 1;
 
-      if Byte(Name[I]) = 0 then
+      if Byte(Name[L]) = 0 then
         break;
 
       AResourceRecord.Name := AResourceRecord.Name + '.';
     end;
   end;
+
 begin
   DNSHeader := PDNSHeader(APkt);
   DNSHeader^.Identification    := ToHostOrder(DNSHeader^.Identification);
@@ -173,7 +176,7 @@ begin
   // All dns queries and responses carry query sections
 
   GetResourceRecordName(DNSQueryRecord, PtrUInt(APkt) + SizeOf(TDNSHeader));
-  Inc(I, 1); // Move past the final byte of the name
+  I := Length(DNSQueryRecord.Name) + 2; // Move past the final byte of the name
   DNSQueryRecord.QueryType := ToHostOrder(PWord(PtrUint(APkt) + SizeOf(TDNSHeader) + I)^);
   Inc(I, 2); // Move past the QueryType field
   DNSQueryRecord.QueryClass := ToHostOrder(PWord(PtrUint(APkt) + SizeOf(TDNSHeader) + I)^);
@@ -187,7 +190,7 @@ begin
   begin
     Op := 'Response';
 
-    for A := 0 to DNSHeader^.AnswerRRCount do
+    for A := 0 to DNSHeader^.AnswerRRCount - 1 do
     begin
       NamePointer := ToHostOrder(PWord(PtrUInt(APkt) + SizeOf(TDNSHeader) + I)^);
       if GetBit(NamePointer, 0) = 1 and GetBit(NamePointer, 1) then
@@ -204,8 +207,16 @@ begin
         DNSAnswerRecords[A].ResourceDataLength := ToHostOrder(PWord(PtrUInt(APkt) + SizeOf(TDNSHeader) + I)^);
         Inc(I, 2); // Move past ResourceDataLength
         SetLength(DNSAnswerRecords[A].ResourceData, DNSAnswerRecords[A].ResourceDataLength);
-        DNSAnswerRecords[A].ResourceData := PByteArray(PtrUInt(APkt) + SizeOf(TDNSHeader) + I)^; // TODO: Fix me, I through an exception...
-
+        for B := Low(DNSAnswerRecords[A].ResourceData) to High(DNSAnswerRecords[A].ResourceData) do
+        begin
+          DNSAnswerRecords[A].ResourceData[B] := PByte(PtrUInt(APkt) + SizeOf(TDNSHeader) + I)^;
+          Inc(I, 1);
+        end;
+      end
+      else
+      begin
+        DoLog('DNS Query that doesn''t use a name pointer, this needs implementing.');
+        exit;
       end;
     end;
   end;
@@ -226,6 +237,13 @@ begin
   end;
 
   DoLog(Format('DNS %s - %s, Type: %s', [Op, DNSQueryRecord.Name, QueryType]));
+  for A := 0 to DNSHeader^.AnswerRRCount - 1 do
+  begin
+    for B := Low(DNSAnswerRecords[A].ResourceData) to High(DNSAnswerRecords[A].ResourceData) do
+      AInetAddr.s_bytes[B + 1] := DNSAnswerRecords[A].ResourceData[B];
+    DoLog(Format('Type: %d, Class: %d, TTL: %d, Address: %s',
+      [DNSAnswerRecords[A].QueryType, DNSAnswerRecords[A].QueryClass, DNSAnswerRecords[A].TimeToLive, NetAddrToStr(AInetAddr)]));
+  end;
 end;
 
 procedure TServiceHandler.HandleHTTP(APkt : LongWord; ALength : Cardinal);
@@ -236,7 +254,7 @@ end;
 procedure TServiceHandler.DoLog(AMessage : String);
 begin
   if Assigned(FLogger) then
-    FLogger(AMessage);
+    FLogger.Log(AMessage);
 end;
 
 end.

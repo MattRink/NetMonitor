@@ -41,8 +41,6 @@ type
 
   TSnifferHandler = procedure(ASecondsSinceStart : double; ALength : integer) of object;
 
-  TSnifferLogger = procedure(AMessage : String; ASecondsSinceStart : double) of object;
-
   THardwareAddress = packed record
     Bytes : array[1..6] of byte;
   end;
@@ -123,6 +121,7 @@ type
 
   TSnifferThread = class(TThread)
   private
+    FRunning : boolean;
     FPcapHandle : PPcap;
     FSniffer : TSniffer;
     FSnifferHandler : TSnifferHandler;
@@ -136,6 +135,7 @@ type
     procedure Execute; override;
     procedure DoLog(AMessage : String);
 
+    property Running : boolean read FRunning;
     property Logger : TLogger read FLogger write SetLogger;
     property PacketHandler : TPacketHandler read FPacketHandler write FPacketHandler;
     property ServiceHandler : TServiceHandler read FServiceHandler write FServiceHandler;
@@ -153,7 +153,7 @@ type
     FSnifferHandler : TSnifferHandler;
     FPacketHandler : TPacketHandler;
     FServiceHandler : TServiceHandler;
-    FSnifferLogger : TSnifferLogger;
+    FSnifferLogger : TLogger;
     FSnifferThread : TSnifferThread;
     FStarted : boolean;
     FTimeStarted : TDateTime;
@@ -178,7 +178,7 @@ type
     property Handler : TSnifferHandler read FSnifferHandler write FSnifferHandler;
     property PacketHandler : TPacketHandler read FPacketHandler;
     property ServiceHandler : TServiceHandler read FServiceHandler;
-    property Logger : TSnifferLogger read FSnifferLogger write FSnifferLogger;
+    property Logger : TLogger read FSnifferLogger write FSnifferLogger;
     property InterfaceNet : String read GetInterfaceNet;
     property InterfaceMask : String read GetInterfaceNet;
     property SecondsSinceStart : double read GetSecondsSinceStart;
@@ -194,7 +194,7 @@ end;
 procedure TPacketHandler.DoLog(AMessage : String);
 begin
   if Assigned(FLogger) then
-    FLogger(AMessage);
+    FLogger.Log(AMessage);
 end;
 
 procedure TPacketHandler.HandleARP(APkt : LongWord; ALength : Cardinal);
@@ -279,6 +279,7 @@ end;
 
 constructor TSnifferThread.Create(ASniffer : TSniffer; APcapHandle : PPcap; ASnifferHandler : TSnifferHandler);
 begin
+  FRunning := false;
   FSniffer := ASniffer;
   FPcapHandle := APcapHandle;
   FSnifferHandler := ASnifferHandler;
@@ -295,6 +296,8 @@ var
   Len : Cardinal;
   EthernetHeader : PEthernetHeader;
 begin
+  FRunning := true;
+
   DoLog('Starting sniffer thread');
 
   while not Terminated do
@@ -344,6 +347,8 @@ begin
   end;
 
   DoLog('Finished sniffing');
+
+  FRunning := false;
 end;
 
 procedure TSnifferThread.SetLogger(ALogger : TLogger);
@@ -354,7 +359,7 @@ end;
 procedure TSnifferThread.DoLog(AMessage : String);
 begin
   if Assigned(FLogger) then
-    FLogger(Format('%s', [AMessage]));
+    FLogger.Log(Format('%s', [AMessage]));
 end;
 
 constructor TSniffer.Create(AOwner : TComponent);
@@ -368,7 +373,7 @@ end;
 procedure TSniffer.DoLog(AMessage : String);
 begin
   if Assigned(FSnifferLogger) then
-    FSnifferLogger(Format('%s', [AMessage]), GetSecondsSinceStart());
+    FSnifferLogger.Log(Format('%s', [AMessage]));
 end;
 
 procedure TSniffer.LoadFromConfig(APath : String);
@@ -447,14 +452,14 @@ begin
   FTimeStarted := Now();
 
   FPacketHandler := TPacketHandler.Create;
-  FPacketHandler.Logger := @DoLog;
+  FPacketHandler.Logger := FSnifferLogger;
   FServiceHandler := TServiceHandler.Create;
-  FServiceHandler.Logger := @DoLog;
+  FServiceHandler.Logger := FSnifferLogger;
 
   FPacketHandler.ServiceHandler := FServiceHandler;
 
   FSnifferThread := TSnifferThread.Create(self, FPcapHandle, FSnifferHandler);
-  FSnifferThread.Logger := @DoLog;
+  FSnifferThread.Logger := FSnifferLogger;
   FSnifferThread.PacketHandler := FPacketHandler;
   FSnifferThread.ServiceHandler := FServiceHandler;
   FSnifferThread.Start;
@@ -478,6 +483,8 @@ begin
       on E : Exception do
         DoLog(E.Message);
     end;
+
+    RTLeventSetEvent(FSnifferLogger.SnifferTerminateEvent);
 
     pcap_close(FPcapHandle);
     FStarted := false;
